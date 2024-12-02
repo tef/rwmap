@@ -25,14 +25,30 @@ func (b *mapEntry) Delete() {
 	b.v.Store(nil)
 }
 
+// We keep two maps, a big map, and a little map. Both under RWMutexes,
+// and we always take a big lock before taking a little lock, then release both
+
+// Reads go through the big map, and occasionally through the little map if there's a miss
+// Writes go through the little map, and get batched up into the big map
+// Deletes nil out the entry, and the entry is added to the little map,
+// so that the entry can be removed from the big map, later
+
+// only creating a new key, or deleting a key, requires a write lock
+// on the little lock, and a big write lock precludes any lock on
+// the little map, allowing access to both big and little maps
+
 type RWMap struct {
 	bigLock    sync.RWMutex
 	bigMap     map[any]*mapEntry
 	littleLock sync.RWMutex // must hold big lock first
 	littleMap  map[any]*mapEntry
+
+	littleReads atomic.Uintptr
+	shouldMerge atomic.Bool
 }
 
 func (m *RWMap) merge() {
+	// big write lock
 	if m.littleMap == nil {
 		return
 	}
@@ -49,30 +65,36 @@ func (m *RWMap) merge() {
 		}
 	}
 	m.littleMap = nil
+	m.littleReads.Store(0)
+	m.shouldMerge.Store(false)
 }
 
 func (m *RWMap) forceMerge() {
+	// no lock
 	m.bigLock.Lock()
 	defer m.bigLock.Unlock()
 	m.merge()
 }
 
 func (m *RWMap) checkMerge() {
-	// if number of misses > num writes, then every entry has been read at least once, on average
-	// if number of writes > max batch size
-	// try to obtain the lock, and merge
-}
-
-func (m *RWMap) tryLock() bool {
-	if m.bigLock.TryLock() {
-		m.merge()
-		return true
+	// no lock
+	if m.shouldMerge.Load() {
+		if m.bigLock.TryLock() {
+			defer m.bigLock.Unlock()
+			m.merge()
+		}
 	}
-	return false
 }
 
 func (m *RWMap) scoreMiss() {
-
+	// have little lock, read or write
+	l := len(m.littleMap)
+	if l > 0 {
+		r := m.littleReads.Add(1)
+		if l >= 64 || r >= 64 {
+			m.shouldMerge.Store(true)
+		}
+	}
 }
 
 func (m *RWMap) Load(key any) (value any, ok bool) {
@@ -91,7 +113,6 @@ func (m *RWMap) Load(key any) (value any, ok bool) {
 		}
 	}
 
-	m.scoreMiss()
 	m.littleLock.RLock()
 	defer m.littleLock.RUnlock()
 
@@ -103,6 +124,7 @@ func (m *RWMap) Load(key any) (value any, ok bool) {
 	if ok && v != nil {
 		value := v.Load()
 		if value != nil {
+			m.scoreMiss()
 			return value, true
 		}
 	}
@@ -111,23 +133,7 @@ func (m *RWMap) Load(key any) (value any, ok bool) {
 }
 
 func (m *RWMap) Store(key, value any) {
-	if m.tryLock() {
-		defer m.bigLock.Unlock()
-		if m.bigMap == nil {
-			m.bigMap = make(map[any]*mapEntry, 8)
-		}
-
-		v, ok := m.bigMap[key]
-		if ok && v != nil && v.Load() != nil {
-			v.Store(value)
-		} else {
-			v = new(mapEntry)
-			v.Store(value)
-			m.bigMap[key] = v
-		}
-
-		return
-	}
+	m.checkMerge()
 
 	m.bigLock.RLock()
 	defer m.bigLock.RUnlock()
@@ -142,7 +148,6 @@ func (m *RWMap) Store(key, value any) {
 		}
 	}
 
-	m.scoreMiss()
 	m.littleLock.Lock()
 	defer m.littleLock.Unlock()
 
@@ -153,6 +158,7 @@ func (m *RWMap) Store(key, value any) {
 		if ok && v != nil {
 			if v.Load() != nil {
 				v.Store(value)
+				m.scoreMiss()
 				return
 			}
 		}
@@ -161,6 +167,7 @@ func (m *RWMap) Store(key, value any) {
 	v := new(mapEntry)
 	v.Store(value)
 	m.littleMap[key] = v
+	m.scoreMiss()
 }
 
 func (m *RWMap) Delete(key any) {
@@ -177,19 +184,20 @@ func (m *RWMap) Delete(key any) {
 				// it exists in big, so therefore it does not exist in little
 				m.littleLock.Lock()
 				m.littleMap[key] = v
+				m.scoreMiss() // as it creates work to be done on big
 				m.littleLock.Unlock()
 			}
 			return
 		}
 	}
 
-	m.scoreMiss()
 	m.littleLock.RLock()
 	defer m.littleLock.RUnlock()
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
 		if ok && v != nil {
+			m.scoreMiss()
 			if v.Load() != nil {
 				v.Store(nil)
 			}
@@ -213,6 +221,7 @@ func (m *RWMap) Swap(key, value any) (previous any, loaded bool) {
 				if value == nil {
 					m.littleLock.Lock()
 					m.littleMap[key] = v
+					m.scoreMiss()
 					m.littleLock.Unlock()
 				}
 				return old, true
@@ -220,7 +229,6 @@ func (m *RWMap) Swap(key, value any) (previous any, loaded bool) {
 		}
 	}
 
-	m.scoreMiss()
 	m.littleLock.Lock()
 	defer m.littleLock.Unlock()
 
@@ -229,6 +237,7 @@ func (m *RWMap) Swap(key, value any) (previous any, loaded bool) {
 	} else {
 		v, ok := m.littleMap[key]
 		if ok && v != nil {
+			m.scoreMiss()
 			old := v.Load()
 			if old != nil {
 				v.Store(value)
@@ -241,6 +250,7 @@ func (m *RWMap) Swap(key, value any) (previous any, loaded bool) {
 		v := new(mapEntry)
 		v.Store(value)
 		m.littleMap[key] = v // if old deleted entry in big, will get overwritten
+		m.scoreMiss()
 	}
 	return value, false
 }
@@ -251,6 +261,7 @@ func (m *RWMap) CompareAndDelete(key, old any) (deleted bool) {
 	}
 
 	m.checkMerge()
+
 	m.bigLock.RLock()
 	defer m.bigLock.RUnlock()
 
@@ -262,6 +273,7 @@ func (m *RWMap) CompareAndDelete(key, old any) (deleted bool) {
 				if v.CompareAndSwap(value, nil) {
 					m.littleLock.Lock()
 					m.littleMap[key] = v
+					m.scoreMiss()
 					m.littleLock.Unlock()
 					return true
 				}
@@ -269,13 +281,14 @@ func (m *RWMap) CompareAndDelete(key, old any) (deleted bool) {
 			}
 		}
 	}
-	m.scoreMiss()
+
 	m.littleLock.RLock()
 	defer m.littleLock.RUnlock()
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
 		if ok && v != nil {
+			m.scoreMiss()
 			value := v.Load()
 			if value == old {
 				return v.CompareAndSwap(value, nil)
@@ -304,13 +317,13 @@ func (m *RWMap) CompareAndSwap(key, old any, newv any) (swapped bool) {
 			}
 		}
 	}
-	m.scoreMiss()
 	m.littleLock.RLock()
 	defer m.littleLock.RUnlock()
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
 		if ok && v != nil {
+			m.scoreMiss()
 			value := v.Load()
 			if value != nil && value == old {
 				return v.CompareAndSwap(old, newv)
@@ -335,21 +348,22 @@ func (m *RWMap) LoadAndDelete(key any) (value any, loaded bool) {
 				v.Delete()
 				m.littleLock.Lock()
 				m.littleMap[key] = v
+				m.scoreMiss()
 				m.littleLock.Unlock()
 				return value, true
 			}
 		}
 	}
 
-	m.scoreMiss()
-	m.littleLock.Lock()
-	defer m.littleLock.Unlock()
+	m.littleLock.RLock()
+	defer m.littleLock.RUnlock()
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
 		if ok && v != nil {
 			value = v.Load()
 			v.Delete()
+			m.scoreMiss()
 			return value, true
 		}
 	}
@@ -374,9 +388,10 @@ func (m *RWMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 		}
 	}
 
-	m.scoreMiss()
 	m.littleLock.RLock()
 	defer m.littleLock.RUnlock()
+
+	m.scoreMiss()
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
@@ -409,8 +424,9 @@ func (m *RWMap) Range(f func(key, value any) bool) {
 		}
 	}
 
-	m.scoreMiss()
 	m.littleLock.RLock()
+	m.scoreMiss()
+
 	for k, v := range m.littleMap {
 		var a any
 		if v != nil {
@@ -423,7 +439,6 @@ func (m *RWMap) Range(f func(key, value any) bool) {
 		}
 	}
 
-	m.scoreMiss()
 	m.littleLock.RUnlock()
 	m.bigLock.RUnlock()
 

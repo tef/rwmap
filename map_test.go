@@ -39,11 +39,14 @@ func TestMap(t *testing.T) {
 	} else if s != "bar" {
 		t.Error("wrong value")
 	}
-	//m.forceMerge()
+	t.Log(m.shouldMerge.Load(), len(m.littleMap))
+	m.shouldMerge.Store(true)
+	m.checkMerge()
 	out, ok = m.Load("foo")
 	if !ok {
 		t.Error("missing value")
 	}
+	t.Log(m.shouldMerge.Load(), len(m.littleMap))
 
 	s, ok = out.(string)
 	if !ok {
@@ -51,6 +54,9 @@ func TestMap(t *testing.T) {
 	} else if s != "bar" {
 		t.Error("wrong value")
 	}
+	m.Store("foo", "bar1")
+	//m.Store("foo2", "bar1")
+	t.Log(m.shouldMerge.Load(), len(m.littleMap))
 }
 
 func BenchMap(b *testing.B) {
