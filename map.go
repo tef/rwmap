@@ -49,19 +49,17 @@ type RWMap struct {
 
 func (m *RWMap) merge() {
 	// big write lock
-	if m.littleMap == nil {
-		return
-	}
+	if len(m.littleMap) > 0 {
+		if m.bigMap == nil {
+			m.bigMap = make(map[any]*mapEntry, len(m.littleMap))
+		}
 
-	if m.bigMap == nil {
-		m.bigMap = make(map[any]*mapEntry, len(m.littleMap))
-	}
-
-	for k, v := range m.littleMap {
-		if v == nil || v.Load() == nil {
-			delete(m.bigMap, k)
-		} else {
-			m.bigMap[k] = v
+		for k, v := range m.littleMap {
+			if v == nil || v.Load() == nil {
+				delete(m.bigMap, k)
+			} else {
+				m.bigMap[k] = v
+			}
 		}
 	}
 	m.littleMap = nil
