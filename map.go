@@ -10,6 +10,9 @@ type mapEntry struct {
 }
 
 func (b *mapEntry) Load() any {
+	if b == nil {
+		return nil
+	}
 	return b.v.Load()
 }
 
@@ -18,7 +21,19 @@ func (b *mapEntry) Store(o any) {
 }
 
 func (b *mapEntry) CompareAndSwap(old any, new any) bool {
+	if old == nil || new == nil {
+		return false
+	}
 	return b.v.CompareAndSwap(old, new)
+}
+
+func (b *mapEntry) CompareAndDelete(old any) bool {
+	return b.v.CompareAndSwap(old, nil)
+}
+
+func (b *mapEntry) LoadAndDelete() (any, bool) {
+	v := b.v.Swap(nil)
+	return v, v != nil
 }
 
 func (b *mapEntry) Delete() {
@@ -55,7 +70,7 @@ func (m *RWMap) merge() {
 		}
 
 		for k, v := range m.littleMap {
-			if v == nil || v.Load() == nil {
+			if v.Load() == nil {
 				delete(m.bigMap, k)
 			} else {
 				m.bigMap[k] = v
@@ -68,14 +83,13 @@ func (m *RWMap) merge() {
 }
 
 func (m *RWMap) forceMerge() {
-	// no lock
 	m.bigLock.Lock()
 	defer m.bigLock.Unlock()
+
 	m.merge()
 }
 
 func (m *RWMap) checkMerge() {
-	// no lock
 	if m.shouldMerge.Load() {
 		if m.bigLock.TryLock() {
 			defer m.bigLock.Unlock()
@@ -85,7 +99,7 @@ func (m *RWMap) checkMerge() {
 }
 
 func (m *RWMap) scoreMiss() {
-	// have little lock, read or write
+	// already have little lock, read or write
 	l := len(m.littleMap)
 	if l > 0 {
 		r := m.littleReads.Add(1)
@@ -103,7 +117,7 @@ func (m *RWMap) Load(key any) (value any, ok bool) {
 
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
-		if ok && v != nil {
+		if ok {
 			value := v.Load()
 			if value != nil {
 				return value, true
@@ -119,7 +133,7 @@ func (m *RWMap) Load(key any) (value any, ok bool) {
 	}
 
 	v, ok := m.littleMap[key]
-	if ok && v != nil {
+	if ok {
 		value := v.Load()
 		if value != nil {
 			m.scoreMiss()
@@ -138,7 +152,7 @@ func (m *RWMap) Store(key, value any) {
 
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
-		if ok && v != nil {
+		if ok {
 			if v.Load() != nil {
 				v.Store(value)
 				return
@@ -153,7 +167,7 @@ func (m *RWMap) Store(key, value any) {
 		m.littleMap = make(map[any]*mapEntry, 8)
 	} else {
 		v, ok := m.littleMap[key]
-		if ok && v != nil {
+		if ok {
 			if v.Load() != nil {
 				v.Store(value)
 				m.scoreMiss()
@@ -168,6 +182,15 @@ func (m *RWMap) Store(key, value any) {
 	m.scoreMiss()
 }
 
+func (m *RWMap) markDeleted(key any, value *mapEntry) {
+	m.littleLock.Lock()
+
+	m.littleMap[key] = value
+	m.scoreMiss() // as it creates work to be done on big
+
+	m.littleLock.Unlock()
+}
+
 func (m *RWMap) Delete(key any) {
 	m.checkMerge()
 
@@ -176,16 +199,9 @@ func (m *RWMap) Delete(key any) {
 
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
-		if ok && v != nil {
-			if v.Load() != nil {
-				v.Store(nil)
-				// it exists in big, so therefore it does not exist in little
-				m.littleLock.Lock()
-				m.littleMap[key] = v
-				m.scoreMiss() // as it creates work to be done on big
-				m.littleLock.Unlock()
-			}
-			return
+		if ok && v.Load() != nil {
+			v.Delete()
+			m.markDeleted(key, v)
 		}
 	}
 
@@ -194,11 +210,9 @@ func (m *RWMap) Delete(key any) {
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
-		if ok && v != nil {
+		if ok && v.Load() != nil {
 			m.scoreMiss()
-			if v.Load() != nil {
-				v.Store(nil)
-			}
+			v.Delete()
 			return
 		}
 	}
@@ -212,17 +226,17 @@ func (m *RWMap) Swap(key, value any) (previous any, loaded bool) {
 
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
-		if ok && v != nil {
+		if ok {
 			old := v.Load()
 			if old != nil {
-				v.Store(value)
 				if value == nil {
-					m.littleLock.Lock()
-					m.littleMap[key] = v
-					m.scoreMiss()
-					m.littleLock.Unlock()
+					v.Delete()
+					m.markDeleted(key, v)
+					return old, true
+				} else {
+					v.Store(value)
+					return old, true
 				}
-				return old, true
 			}
 		}
 	}
@@ -234,12 +248,18 @@ func (m *RWMap) Swap(key, value any) (previous any, loaded bool) {
 		m.littleMap = make(map[any]*mapEntry, 8)
 	} else {
 		v, ok := m.littleMap[key]
-		if ok && v != nil {
-			m.scoreMiss()
+		if ok {
 			old := v.Load()
 			if old != nil {
-				v.Store(value)
-				return old, true
+				if value == nil {
+					v.Delete()
+					m.markDeleted(key, v)
+					return old, true
+				} else {
+					v.Store(value)
+					m.scoreMiss()
+					return old, true
+				}
 			}
 		}
 	}
@@ -265,16 +285,11 @@ func (m *RWMap) CompareAndDelete(key, old any) (deleted bool) {
 
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
-		if ok && v != nil {
-			value := v.Load()
-			if value != nil && value == old {
-				if v.CompareAndSwap(value, nil) {
-					m.littleLock.Lock()
-					m.littleMap[key] = v
-					m.scoreMiss()
-					m.littleLock.Unlock()
-					return true
-				}
+		if ok {
+			if v.CompareAndDelete(old) {
+				m.markDeleted(key, v)
+				return true
+			} else {
 				return false
 			}
 		}
@@ -285,12 +300,9 @@ func (m *RWMap) CompareAndDelete(key, old any) (deleted bool) {
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
-		if ok && v != nil {
+		if ok {
 			m.scoreMiss()
-			value := v.Load()
-			if value == old {
-				return v.CompareAndSwap(value, nil)
-			}
+			return v.CompareAndDelete(old)
 		}
 	}
 
@@ -340,14 +352,11 @@ func (m *RWMap) LoadAndDelete(key any) (value any, loaded bool) {
 
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
-		if ok && v != nil {
-			value = v.Load()
-			if value != nil {
+		if ok {
+			value, loaded := v.LoadAndDelete()
+			if loaded {
 				v.Delete()
-				m.littleLock.Lock()
-				m.littleMap[key] = v
-				m.scoreMiss()
-				m.littleLock.Unlock()
+				m.markDeleted(key, v)
 				return value, true
 			}
 		}
@@ -358,11 +367,13 @@ func (m *RWMap) LoadAndDelete(key any) (value any, loaded bool) {
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
-		if ok && v != nil {
-			value = v.Load()
-			v.Delete()
-			m.scoreMiss()
-			return value, true
+		if ok {
+			value, loaded := v.LoadAndDelete()
+			if loaded {
+				v.Delete()
+				m.scoreMiss()
+				return value, true
+			}
 		}
 	}
 
@@ -378,7 +389,7 @@ func (m *RWMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
-		if ok && v != nil {
+		if ok {
 			value = v.Load()
 			if value != nil {
 				return value, true
@@ -393,7 +404,7 @@ func (m *RWMap) LoadOrStore(key, value any) (actual any, loaded bool) {
 
 	if m.littleMap != nil {
 		v, ok := m.littleMap[key]
-		if ok && v != nil {
+		if ok {
 			value = v.Load()
 			if value != nil {
 				return value, true
