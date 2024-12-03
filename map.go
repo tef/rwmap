@@ -71,8 +71,11 @@ func (m *RWMap) merge() {
 
 		for k, v := range m.littleMap {
 			if v.Load() == nil {
-				o, ok :=  m.bigMap[k]
-				if ok && o.Load() == nil {
+				// a deleted sentinel
+				old, ok := m.bigMap[k]
+				if ok && old.Load() == nil {
+					// remove if big map is marked
+					// deleted
 					delete(m.bigMap, k)
 				}
 			} else {
@@ -185,44 +188,22 @@ func (m *RWMap) Store(key, value any) {
 	m.scoreMiss()
 }
 
-func (m *RWMap) deleteBig(key any, value *mapEntry) {
+func (m *RWMap) markDeleted(key any, value *mapEntry) {
 	m.littleLock.Lock()
 
-	value.Delete() // to avoid race between marking deleted & inserting into little
-	m.littleMap[key] = value
+	v, ok := m.littleMap[key]; 
+
+	// in theory, another thread could see our deleted value inside big
+	// and add a new value, so we insert our record only if it's missing
+
+	if !ok || v == nil {
+		m.littleMap[key] = value
+	}
 	m.scoreMiss() // as it creates work to be done on big
 
 	m.littleLock.Unlock()
 }
 
-func (m *RWMap) loadAndDeleteBig(key any, value *mapEntry) (any, bool) {
-	m.littleLock.Lock()
-
-	old, loaded := value.LoadAndDelete()
-	if loaded {
-		// to avoid race between marking deleted & inserting into little
-		m.littleMap[key] = value
-		m.scoreMiss() // as it creates work to be done on big
-	}
-
-	m.littleLock.Unlock()
-	return old, loaded
-}
-
-
-func (m *RWMap) compareAndDeleteBig(key any, value *mapEntry, old any) bool {
-	m.littleLock.Lock()
-
-	deleted := value.CompareAndDelete(old) 
-	if deleted { 
-		// to avoid race between marking deleted & inserting into little
-		m.littleMap[key] = value
-		m.scoreMiss() // as it creates work to be done on big
-	}
-
-	m.littleLock.Unlock()
-	return deleted
-}
 func (m *RWMap) Delete(key any) {
 	m.checkMerge()
 
@@ -232,7 +213,8 @@ func (m *RWMap) Delete(key any) {
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
 		if ok && v.Load() != nil {
-			m.deleteBig(key, v)
+			v.Delete()
+			m.markDeleted(key, v)
 		}
 	}
 
@@ -262,7 +244,7 @@ func (m *RWMap) Swap(key, value any) (previous any, loaded bool) {
 			if old != nil {
 				if value == nil {
 					v.Delete()
-					m.deleteBig(key, v)
+					m.markDeleted(key, v)
 					return old, true
 				} else {
 					v.Store(value)
@@ -284,7 +266,7 @@ func (m *RWMap) Swap(key, value any) (previous any, loaded bool) {
 			if old != nil {
 				if value == nil {
 					v.Delete()
-					m.deleteBig(key, v)
+					m.markDeleted(key, v)
 					return old, true
 				} else {
 					v.Store(value)
@@ -317,7 +299,8 @@ func (m *RWMap) CompareAndDelete(key, old any) (deleted bool) {
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
 		if ok {
-			if m.compareAndDeleteBig(key, v, old) {
+			if v.CompareAndDelete(old) {
+				m.markDeleted(key, v)
 				return true
 			} else {
 				return false
@@ -383,8 +366,10 @@ func (m *RWMap) LoadAndDelete(key any) (value any, loaded bool) {
 	if m.bigMap != nil {
 		v, ok := m.bigMap[key]
 		if ok {
-			value, loaded := m.loadAndDeleteBig(key, v)
+			value, loaded := v.LoadAndDelete()
 			if loaded {
+				v.Delete()
+				m.markDeleted(key, v)
 				return value, true
 			}
 		}
