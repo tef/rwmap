@@ -71,7 +71,10 @@ func (m *RWMap) merge() {
 
 		for k, v := range m.littleMap {
 			if v.Load() == nil {
-				delete(m.bigMap, k)
+				o, ok :=  m.bigMap[k]
+				if ok && o.Load() == nil {
+					delete(m.bigMap, k)
+				}
 			} else {
 				m.bigMap[k] = v
 			}
